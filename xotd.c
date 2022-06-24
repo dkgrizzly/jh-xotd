@@ -114,7 +114,7 @@ struct xot {
 	pthread_mutex_t lock;
 	int busy;
 	int closing;
-	
+
 	int call_len;
 	unsigned char call [256];
 };
@@ -165,6 +165,7 @@ void *inbound(void*);
 
 void read_config (char *name);
 void config_device (char *device_name, char *remote, char *setup, char *circuits);
+void dynamic_device (struct sockaddr_in *addr);
 
 int read_xot (struct xot *xot, unsigned char *packet, int len);
 int read_tap (struct xot_device *dev, unsigned char *cmd, unsigned char *buf, int len);
@@ -182,15 +183,14 @@ static char *addr (struct sockaddr *sa) {
 	}
 }
 
-	
 
 /* xot must be locked before use */
-   
+
 static void busy_xot (struct xot *xot) {
 	++xot->busy;
 	printd ("busy (%d)", xot->busy);
 }
-	
+
 
 /* xot MUST NOT be locked before use; asymetry rules */
 
@@ -199,14 +199,14 @@ void idle_xot (struct xot *xot) {
 	pthread_mutex_lock (&xot->lock);
 
 	printd ("idle (busy = %d, closing = %d)", xot->busy, xot->closing);
-	
+
 	if (!--xot->busy && xot->closing) {
 		pthread_cond_broadcast (&wait_for_idle);
 	}
 
 	pthread_mutex_unlock (&xot->lock);
 }
-    
+
 
 
 static inline int get_lci(const unsigned char *packet)
@@ -226,7 +226,7 @@ int main(int argc, char *argv[])
 
     char   *config = NULL;
     int	   unit;
-    
+
     struct xot_device *dev;
 
     while ((c = getopt(argc, argv, "l:r:vf:h")) != -1)
@@ -273,21 +273,21 @@ int main(int argc, char *argv[])
 				   argc - optind > 3 ? argv[optind+2] : NULL);
     }
 
-    if (errflg || max_device == 0) {
+    if (errflg/* || max_device == 0*/) {
 	    usage ();
 	    return 1;
     }
-	    
+
 
 #ifndef DEBUG
     /* Let's become a daemon */
-    daemon_start(); 
+    daemon_start();
 
     openlog("xotd", LOG_PID /*|LOG_NOWAIT*/, LOG_DAEMON);
 #endif
 
     pthread_cond_init (&wait_for_idle, NULL);
-    
+
     /* Make socket for incoming XOT calls */
 
     if ((sock = socket (AF_INET, SOCK_STREAM, 0)) == -1) {
@@ -298,17 +298,17 @@ int main(int argc, char *argv[])
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR/*|SO_DEBUG*/, &on, sizeof on);
 
     memset(&addr, 0, sizeof addr);
-    
+
     addr.sin_family = AF_INET;
     addr.sin_port = htons (lport);
     addr.sin_addr.s_addr = htonl (INADDR_ANY);
-    
+
     if (bind (sock, (struct sockaddr *) &addr, sizeof addr) == -1) {
 	    printd ("Error binding socket: %s", strerror(errno));
 	    close (sock);
 	    return 2;
     }
-    
+
     if (listen (sock, 8) == -1) {
 	printd ("Error listening socket: %s", strerror (errno));
 	close (sock);
@@ -316,25 +316,25 @@ int main(int argc, char *argv[])
     }
 
     /* Start all the outbound threads, copy x.25 -> tcp */
-    
+
     unit = 0;
-    
+
     for (dev = device; dev < device + max_device; ++dev) {
 	    if (create_outbound (dev)) ++unit;
     }
 
-    if (!unit) return 2;
-    
+//    if (!unit) return 2;
+
 #ifdef DEBUG
     printd ("Waiting for connections.");
 #endif
-    
+
     for (;;) {
 
 	socklen_t len = sizeof addr;
 	int fd;
 	struct xot *xot;
-	
+
 	if ((fd = accept (sock, (struct sockaddr *) &addr, &len)) == -1) {
 		printd ("accept error: %s", strerror(errno));
 		exit (1);
@@ -344,10 +344,10 @@ int main(int argc, char *argv[])
 		close (fd);
 		continue;
 	}
-	
+
 	create_inbound (xot);
     }
- 
+
     return 0;
 }
 
@@ -410,7 +410,7 @@ int create_outbound (struct xot_device *dev) {
 		strcpy (command, dev->setup);
 		strcat (command, " ");
 		strcat (command, dev->name);
-		
+
 		if (system (command)) {
 			printd ("setup command %s failed", command);
 			free (command);
@@ -442,9 +442,9 @@ int create_outbound (struct xot_device *dev) {
 void create_inbound (struct xot *xot) {
 
 	int e;
-	
+
 	pthread_attr_t attr;
-	
+
 	pthread_attr_init (&attr);
 	pthread_attr_setdetachstate (&attr, PTHREAD_CREATE_DETACHED);
 
@@ -453,7 +453,7 @@ void create_inbound (struct xot *xot) {
 		/* clean up ... */
 		return;
 	}
-	
+
 	pthread_attr_destroy(&attr);
 }
 
@@ -468,20 +468,28 @@ struct xot *find_xot_for_call (int fd, struct sockaddr_in *addr) {
 	struct xot_device *dev;
 	struct xot *xot;
 	int lci;
+	int device_added = 0;
 
 	/* First find the device */
 
-	for (dev = device; dev < device + max_device; ++dev) {
-		struct sockaddr *a;
+	search_again:
+		for (dev = device; dev < device + max_device; ++dev) {
+			struct sockaddr *a;
 
-		for (a = dev->addr; a < dev->addr + dev->max_addr; ++a) {
-			if (((struct sockaddr_in *)a)->sin_addr.s_addr ==
-			    addr->sin_addr.s_addr)
-				goto found_device;
+			for (a = dev->addr; a < dev->addr + dev->max_addr; ++a) {
+				if (((struct sockaddr_in *)a)->sin_addr.s_addr ==
+				    addr->sin_addr.s_addr)
+					goto found_device;
+			}
 		}
-	}
 
-	printd ("call from unknown address %s", inet_ntoa (addr->sin_addr));
+		if(device_added == 0) {
+			printd ("call from unknown address %s", inet_ntoa (addr->sin_addr));
+
+			dynamic_device(addr);
+			device_added = 1;
+			goto search_again;
+		}
 
 	return NULL;
 
@@ -492,13 +500,13 @@ struct xot *find_xot_for_call (int fd, struct sockaddr_in *addr) {
 	/* Fixme - doesn't allow LCI0 */
 
 	pthread_mutex_lock (&dev->lock);
-	
+
 	for (lci = dev->max_xot - 1; lci; --lci) {
 		if (!dev->xot [lci]) goto found_lci;
 	}
 
 	pthread_mutex_unlock (&dev->lock);
-	
+
 	printd ("Too many vc's from %s", inet_ntoa (addr->sin_addr));
 
 	return NULL;
@@ -517,7 +525,7 @@ struct xot *find_xot_for_call (int fd, struct sockaddr_in *addr) {
 	dev->xot [lci] = xot;
 
 	pthread_mutex_unlock (&dev->lock);
-	
+
 	return xot;
 }
 
@@ -534,9 +542,9 @@ struct xot *find_xot_for_packet (struct xot_device *dev,
 {
 
 	struct xot *xot;
-	
+
 	int lci = get_lci (packet);
-		
+
 	if (lci == 0) {		/* ignore this one, see 6.4 in RFC */
 		if (packet[2] == RESTART_REQUEST) {
 			packet [2] = RESTART_CONFIRMATION;
@@ -551,7 +559,7 @@ struct xot *find_xot_for_packet (struct xot_device *dev,
 	}
 
 	pthread_mutex_lock (&dev->lock);
-		
+
 	if (!(xot = dev->xot [lci])) {
 
 		/* Not connected */
@@ -561,7 +569,7 @@ struct xot *find_xot_for_packet (struct xot_device *dev,
 			/* discard the message */
 
 			pthread_mutex_unlock (&dev->lock);
-			
+
 			return NULL;
 
 		    default:
@@ -574,7 +582,7 @@ struct xot *find_xot_for_packet (struct xot_device *dev,
 
 		    case CALL_REQUEST:
 			;
-			
+
 			/* All is good, make the call */
 		}
 
@@ -586,7 +594,7 @@ struct xot *find_xot_for_packet (struct xot_device *dev,
 		xot->lci = lci;
 
 		pthread_mutex_init (&xot->lock, NULL);
-		
+
 		pthread_mutex_unlock (&dev->lock);
 
 		/* Save call packet 'till connected to remote */
@@ -595,14 +603,14 @@ struct xot *find_xot_for_packet (struct xot_device *dev,
 		memcpy (xot->call, packet, len);
 
 		/* Create thread for TCP->X.25, it'll make the call */
-		
+
 		create_inbound (xot);
 
 		return NULL;	/* send call after connected */
 	}
 
 	/* DANGER - locked device, then xot - always in that order! */
-	
+
 	pthread_mutex_lock (&xot->lock);
 
 	pthread_mutex_unlock (&dev->lock);
@@ -613,7 +621,7 @@ struct xot *find_xot_for_packet (struct xot_device *dev,
 		xot->cleared = packet [2];
 
 		pthread_mutex_unlock (&xot->lock);
-		
+
 		return NULL;
 	}
 
@@ -622,24 +630,24 @@ struct xot *find_xot_for_packet (struct xot_device *dev,
 		/* It's being closed */
 
 		pthread_mutex_unlock (&xot->lock);
-		
+
 		return NULL;
 	}
 
 	busy_xot (xot);
-		
+
 	pthread_mutex_unlock (&xot->lock);
-			
+
 	if (packet [2] == CALL_REQUEST) {
 		printd ("call request on active channel");
 		idle_xot (xot);
 		goto force_clear;
 	}
-		
+
 	xot->cleared = packet [2];
 
 	/* Copy GFI, LCI from call packet */
-	
+
 	packet [0] = (packet [0] & 0xa0) + (xot->call [0] & 0x3f);
 	packet [1] = xot->call [1];
 
@@ -648,13 +656,13 @@ struct xot *find_xot_for_packet (struct xot_device *dev,
     force_clear:
 
 	printd ("fake clear");
-			
+
 	packet[2] = CLEAR_REQUEST;
 	packet[3] = 0x05;
 	packet[4] = 0;
-	
+
 	write_tap (dev, 0x00, packet, 5);
-		
+
 	return NULL;
 }
 
@@ -671,23 +679,23 @@ struct xot *find_xot_for_packet (struct xot_device *dev,
 void *outbound(void *arg)
 {
     struct xot_device *dev = arg;
-	
+
     int nread;
 
     unsigned char packet [MAX_PKT_LEN];
-    
+
     for (;;) {
 
 	struct xot *xot;
 	unsigned char type;
 
 	nread = read_tap (dev, &type, packet, MAX_PKT_LEN);
-	
+
 	if (nread < 0) {
 		printd("tap read error: %s", strerror(errno));
 		break;
 	}
-	
+
 	switch (type) {
 	    case 0x00:  			/* data request */
 		if (nread < MIN_PKT_LEN)	/* invalid packet size ? */
@@ -710,7 +718,7 @@ void *outbound(void *arg)
 			printd ("outbound done with xot %p", xot);
 
 			/* This should kill the inbound side */
-			
+
 			shutdown (xot->sock, SHUT_RDWR);
 
 			/* We should not send on this xot */
@@ -751,14 +759,14 @@ void *outbound(void *arg)
 		    return NULL;
 		}
 	        break;
-		
-	    case 0x03: 
+
+	    case 0x03:
 #ifdef DEBUG
 		printd("Tap->TCP: [param], %d data bytes", nread);
 #endif
 	        printd("changing parameters not supported");
 	        break;
-		
+
 	    default:
 	        printd("read from tap: unknown command %#x",type);
 		break;
@@ -790,7 +798,7 @@ void *inbound(void *arg)
     int len;
 
     unsigned char packet [MAX_PKT_LEN];
-    
+
     if (isVerbose)
 	printd("lci=%d New TCP connection (tap inbound).", xot->lci);
 
@@ -798,36 +806,36 @@ void *inbound(void *arg)
 
 	    int sock;
 	    struct sockaddr *a;
-	    
+
 	    /* It's up to us to make the call */
-		
+
 	    for (a = dev->addr; a < dev->addr + dev->max_addr; ++a) {
 		    sock = socket (a->sa_family, SOCK_STREAM, 0);
 		    if (sock == -1) {
 			    printd ("socket: %s", strerror (errno));
 			    goto clear;
 		    }
-		    
+
 		    if (connect (sock, a, sizeof *a) == 0) goto ok;
-		    
+
 		    printd ("%s: %s", addr (a), strerror (errno));
 		    close (sock);
 	    }
 
 	    /* all call attempts failed; tell X.25 */
-	    
+
 	    goto clear;
 
 	ok:
 	    pthread_mutex_lock (&xot->lock);
 
 	    printd ("connected to %s", addr (a));
-	    
+
 	    if (xot->cleared == CLEAR_REQUEST) {
 		    /* but X.25 has decided to give up. */
 
 		    pthread_mutex_unlock (&xot->lock);
-		    
+
 		    goto clear;
 	    }
 
@@ -841,12 +849,12 @@ void *inbound(void *arg)
 
 	    printd ("gfi=%02x lcn=%02x pti=%02x",
 		    xot->call[0], xot->call[1], xot->call[2]);
-	
-	    if (!write_xot (xot, xot->call, xot->call_len)) {    
+
+	    if (!write_xot (xot, xot->call, xot->call_len)) {
 		 printd("write_xot error: %s", strerror(errno));
 	    }
     }
-		    
+
     do {
 	/*
 	 * TODO: replace MAX_PKT_LEN by the X.25 device MTU (packet size)
@@ -868,7 +876,7 @@ void *inbound(void *arg)
 	switch (packet[2]) {
 
 	    case CLEAR_CONFIRMATION:
-		
+
 		pthread_mutex_lock (&dev->lock);
 
 		if (dev->xot [xot->lci] == xot) {
@@ -876,7 +884,7 @@ void *inbound(void *arg)
 		}
 
 		pthread_mutex_unlock (&dev->lock);
-		
+
 		xot->cleared = CLEAR_CONFIRMATION;
 		break;
 
@@ -887,7 +895,7 @@ void *inbound(void *arg)
 		if ((xot->call_len = nread) > sizeof xot->call) {
 			xot->call_len = sizeof xot->call;
 		}
-		
+
 		memcpy (xot->call, packet, xot->call_len);
 	}
 
@@ -897,14 +905,14 @@ void *inbound(void *arg)
 
 	packet [0] = (packet [0] & 0xf0) + xot->lci / 256;
 	packet [1] = xot->lci;
-	
+
 	if (!write_tap (dev, 0x00, packet, nread)) {
 		printd("Tap write error: %s",strerror(errno));
 		break;
 	}
 
 	/* If we get a clear confirm from remote then we can hang up */
-	
+
     }
     while (xot->cleared != CLEAR_CONFIRMATION);
 
@@ -921,7 +929,7 @@ clear:
 	    packet [2] = CLEAR_CONFIRMATION;
 	    len = 3;
 	    goto send;
-	    
+
 	default:
 	    printd ("send clear request to x.25");
 	    packet [2] = CLEAR_REQUEST;
@@ -932,12 +940,12 @@ clear:
 	send:
 	    packet [0] = 0x10 + xot->lci / 256;
 	    packet [1] = xot->lci;
-	    
+
 	    write_tap (xot->device, 0x00, packet, len);
     }
 
     /* Wait for outbound side to finish work */
-    
+
     pthread_mutex_lock (&xot->lock);
 
     ++xot->closing;
@@ -959,17 +967,17 @@ clear:
     }
 
     pthread_mutex_unlock (&dev->lock);
-    
+
     printd ("idle");
 
     close (xot->sock);
 
     pthread_mutex_destroy (&xot->lock);
-    
+
     free (xot);
 
     printd ("done");
-    
+
     return NULL;
 }
 
@@ -1080,7 +1088,7 @@ int read_xot (struct xot *xot, unsigned char *packet, int len) {
 
 
 int read_tap (struct xot_device *dev, unsigned char *cmd, unsigned char *buf, int len) {
-	
+
 	struct tap_header head;
 
 	struct iovec iov [3];
@@ -1145,12 +1153,12 @@ void printd(const char *format, ...)
 
 void print_x25 (const char *head, const unsigned char *packet, int len) {
 	int gfi = *packet;
-	
+
 	int extended = (gfi & 0x30) == 0x20;
 
 	int lci = get_lci (packet);
 	int pti = packet [2];
-	
+
 	if (!(pti & 1)) {	/* Data packet */
 		int ps = pti >> 1, pr, m;
 		if (extended) {
@@ -1295,6 +1303,31 @@ void read_config (char *name) {
 	if (f != stdin) fclose (f);
 }
 
+void dynamic_device (struct sockaddr_in *addr) {
+	struct xot_device *dev;
+
+	++max_device;
+
+	device = realloc (device, max_device * sizeof *device);
+
+	dev = &device [max_device - 1];
+
+	*dev->name = 0;
+	dev->setup = NULL;
+	dev->max_xot = 256;
+	dev->xot = calloc (dev->max_xot, sizeof *dev->xot);
+
+	dev->addr = calloc (1, sizeof  *device->addr);
+	dev->max_addr = 1;
+
+	struct sockaddr_in *devaddr =
+		(struct sockaddr_in *) (&dev->addr[0]);
+	devaddr->sin_family = AF_INET;
+	devaddr->sin_port = htons (rport);
+	memcpy (&devaddr->sin_addr, &addr->sin_addr, sizeof(addr->sin_addr));
+
+	create_outbound (dev);
+}
 
 void config_device (char *device_name, char *remote_name, char *setup, char *circuits) {
 
@@ -1304,7 +1337,7 @@ void config_device (char *device_name, char *remote_name, char *setup, char *cir
 	int vc;
 
 	struct xot_device *dev;
-	
+
 	if (!(host = gethostbyname (remote_name))) {
 		fprintf (stderr, "Can't find %s for %s\n",
 			 remote_name, device_name);
@@ -1332,7 +1365,7 @@ void config_device (char *device_name, char *remote_name, char *setup, char *cir
 	if (device_name && strcmp (device_name, "=") != 0) {
 		strncat (dev->name, device_name, sizeof dev->name);
 	}
-	
+
 	if (!setup || strcmp (setup, "=") == 0) {
 		dev->setup = NULL;
 	}
@@ -1342,16 +1375,16 @@ void config_device (char *device_name, char *remote_name, char *setup, char *cir
 
 	dev->max_xot = vc;
 	dev->xot = calloc (dev->max_xot, sizeof *dev->xot);
-    
+
 	for (n = 0; host->h_addr_list[n]; ++n);
 
 	dev->addr = calloc (n, sizeof  *device->addr);
 	dev->max_addr = n;
 
-	for (n = 0; n < device->max_addr; ++n) {
+	for (n = 0; n < dev->max_addr; ++n) {
 		struct sockaddr_in *addr =
-			(struct sockaddr_in *) (&device->addr[n]);
-	    
+			(struct sockaddr_in *) (&dev->addr[n]);
+
 		addr->sin_family = AF_INET;
 		addr->sin_port = htons (rport);
 		memcpy (&addr->sin_addr,
